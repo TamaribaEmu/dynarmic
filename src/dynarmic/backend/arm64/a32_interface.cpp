@@ -72,6 +72,13 @@ struct Jit::Impl final {
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
+    void InvalidateCacheRangeNow(std::uint32_t start_address, std::size_t length) {
+        ASSERT(!jit_interface->is_executing);
+        boost::icl::interval_set<u32> ranges;
+        ranges.add(boost::icl::discrete_interval<u32>::closed(start_address, static_cast<u32>(start_address + length - 1)));
+        current_address_space.InvalidateCacheRanges(ranges);
+    }
+
     void Reset() {
         current_state = {};
     }
@@ -143,8 +150,19 @@ struct Jit::Impl final {
         return current_address_space.GetCompiledBlockDescriptors();
     }
 
+    std::vector<std::uint64_t> GetCompiledBlockDescriptors(std::uint32_t start_address, std::size_t length) const {
+        return current_address_space.GetCompiledBlockDescriptorsInRange(start_address, length);
+    }
+
+    std::vector<JitBlockCacheEntry> GetCompiledBlockEntries(std::uint32_t start_address, std::size_t length) const {
+        return HashEntries(current_address_space.GetCompiledBlockEntriesInRange(start_address, length));
+    }
+
     std::vector<JitBlockCacheEntry> GetCompiledBlockEntries() const {
-        const auto entries = current_address_space.GetCompiledBlockEntries();
+        return HashEntries(current_address_space.GetCompiledBlockEntries());
+    }
+
+    std::vector<JitBlockCacheEntry> HashEntries(const std::vector<Backend::Arm64::CachedBlockEntry>& entries) const {
         std::vector<JitBlockCacheEntry> result;
         result.reserve(entries.size());
         for (const auto& entry : entries) {
@@ -250,6 +268,10 @@ void Jit::InvalidateCacheRange(std::uint32_t start_address, std::size_t length) 
     impl->InvalidateCacheRange(start_address, length);
 }
 
+void Jit::InvalidateCacheRangeNow(std::uint32_t start_address, std::size_t length) {
+    impl->InvalidateCacheRangeNow(start_address, length);
+}
+
 void Jit::Reset() {
     impl->Reset();
 }
@@ -310,8 +332,16 @@ std::vector<std::uint64_t> Jit::GetCompiledBlockDescriptors() const {
     return impl->GetCompiledBlockDescriptors();
 }
 
+std::vector<std::uint64_t> Jit::GetCompiledBlockDescriptors(std::uint32_t start_address, std::size_t length) const {
+    return impl->GetCompiledBlockDescriptors(start_address, length);
+}
+
 std::vector<JitBlockCacheEntry> Jit::GetCompiledBlockEntries() const {
     return impl->GetCompiledBlockEntries();
+}
+
+std::vector<JitBlockCacheEntry> Jit::GetCompiledBlockEntries(std::uint32_t start_address, std::size_t length) const {
+    return impl->GetCompiledBlockEntries(start_address, length);
 }
 
 std::size_t Jit::ReactivateBlocks(const std::vector<JitBlockCacheEntry>& entries) {

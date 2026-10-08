@@ -71,6 +71,11 @@ public:
      */
     void InvalidateCacheRange(std::uint32_t start_address, std::size_t length);
 
+    /// Like InvalidateCacheRange, but done before returning rather than at the next Run.
+    /// Only while not executing. The ARM64 backend keeps the code, so the blocks can be
+    /// reactivated (ReactivateBlocks); the other backends defer as InvalidateCacheRange does.
+    void InvalidateCacheRangeNow(std::uint32_t start_address, std::size_t length);
+
     /**
      * Reset CPU state to state at startup. Does not clear code cache.
      * Cannot be called from a callback.
@@ -130,9 +135,15 @@ public:
 
     /// Returns descriptors for blocks currently present in the host code cache.
     std::vector<std::uint64_t> GetCompiledBlockDescriptors() const;
+    /// Those starting in [start_address, start_address + length) where the backend can find them
+    /// by range (arm64); other backends return all of them, so callers still filter.
+    std::vector<std::uint64_t> GetCompiledBlockDescriptors(std::uint32_t start_address, std::size_t length) const;
 
     /// Captures active guest descriptors and their retained host-code entry points.
     std::vector<JitBlockCacheEntry> GetCompiledBlockEntries() const;
+    /// Only the blocks starting in [start_address, start_address + length): cheaper, since
+    /// each entry's instruction hash is computed only for those.
+    std::vector<JitBlockCacheEntry> GetCompiledBlockEntries(std::uint32_t start_address, std::size_t length) const;
 
     /// Reactivates retained host code after its identical guest code has been mapped again.
     std::size_t ReactivateBlocks(const std::vector<JitBlockCacheEntry>& entries);

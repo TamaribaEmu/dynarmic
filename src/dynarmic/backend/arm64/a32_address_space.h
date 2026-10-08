@@ -29,6 +29,11 @@ public:
 
     std::optional<u64> GuestCodeHash(u64 descriptor, u64 end_descriptor) const;
 
+    /// GetCompiledBlockEntries for the blocks starting in [start, start + length) only, found
+    /// through the per-page range index instead of by walking every compiled block.
+    std::vector<CachedBlockEntry> GetCompiledBlockEntriesInRange(u32 start, std::size_t length) const;
+    std::vector<u64> GetCompiledBlockDescriptorsInRange(u32 start, std::size_t length) const;
+
 protected:
     friend class A32Core;
 
@@ -37,6 +42,7 @@ protected:
     void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) override;
     bool CanReactivateBlock(CodePtr entry_point) const override;
     void ClearReactivationMetadata() override;
+    void RegisterReactivatedBlock(const CachedBlockEntry& entry) override;
 
     const A32::UserConfig conf;
     BlockRangeInformation<u32> block_ranges;

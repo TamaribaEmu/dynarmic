@@ -36,7 +36,7 @@ void BlockRangeInformation<ProgramCounterType>::ClearCache() {
 }
 
 template<typename ProgramCounterType>
-tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>::InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges) {
+tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>::InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges) const {
     tsl::robin_set<IR::LocationDescriptor> erase_locations;
     for (const auto& invalidate_interval : ranges) {
         if (boost::icl::is_empty(invalidate_interval)) {
@@ -61,6 +61,40 @@ tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>
         }
     }
     // TODO: EFFICIENCY: Remove ranges that are to be erased.
+    return erase_locations;
+}
+
+template<typename ProgramCounterType>
+tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>::ExtractRanges(const boost::icl::interval_set<ProgramCounterType>& ranges) {
+    tsl::robin_set<IR::LocationDescriptor> erase_locations;
+    for (const auto& invalidate_interval : ranges) {
+        if (boost::icl::is_empty(invalidate_interval)) {
+            continue;
+        }
+        const ProgramCounterType invalidate_start = boost::icl::first(invalidate_interval);
+        const ProgramCounterType invalidate_end = boost::icl::last(invalidate_interval);
+        ProgramCounterType page = invalidate_start >> PageShift;
+        const ProgramCounterType end_page = invalidate_end >> PageShift;
+        for (;;) {
+            if (const auto bucket = block_ranges.find(page); bucket != block_ranges.end()) {
+                auto& entries = bucket.value();
+                std::erase_if(entries, [&](const RangeEntry& entry) {
+                    if (entry.start <= invalidate_end && entry.end >= invalidate_start) {
+                        erase_locations.insert(entry.descriptor);
+                        return true;
+                    }
+                    return false;
+                });
+                if (entries.empty()) {
+                    block_ranges.erase(bucket);
+                }
+            }
+            if (page == end_page) {
+                break;
+            }
+            ++page;
+        }
+    }
     return erase_locations;
 }
 

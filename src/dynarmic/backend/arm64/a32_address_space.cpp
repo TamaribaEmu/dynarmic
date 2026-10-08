@@ -170,7 +170,7 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
         Optimization::A32GetSetElimination(ir_block, {.convert_nzc_to_nz = true});
         Optimization::DeadCodeElimination(ir_block);
     }
-    if (!fast_precompile && conf.HasOptimization(OptimizationFlag::ConstProp)) {
+    if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
         Optimization::A32ConstantMemoryReads(ir_block, conf.callbacks);
         Optimization::ConstantPropagation(ir_block);
         Optimization::DeadCodeElimination(ir_block);
@@ -179,6 +179,37 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
     Optimization::VerificationPass(ir_block);
 
     return ir_block;
+}
+
+std::vector<CachedBlockEntry> A32AddressSpace::GetCompiledBlockEntriesInRange(u32 start, std::size_t length) const {
+    std::vector<CachedBlockEntry> entries;
+    if (length == 0) {
+        return entries;
+    }
+    block_ranges.ForEachStartingIn(start, static_cast<u32>(start + length - 1), [&](const IR::LocationDescriptor& descriptor) {
+        const auto entry = block_entries.find(descriptor);
+        if (entry == block_entries.end() || !CanReactivateBlock(entry->second)) {
+            return;  // not active now
+        }
+        const auto end = block_end_locations.find(entry->second);
+        if (end != block_end_locations.end()) {
+            entries.push_back({descriptor.Value(), end->second.Value(), entry->second});
+        }
+    });
+    return entries;
+}
+
+std::vector<u64> A32AddressSpace::GetCompiledBlockDescriptorsInRange(u32 start, std::size_t length) const {
+    std::vector<u64> result;
+    if (length == 0) {
+        return result;
+    }
+    block_ranges.ForEachStartingIn(start, static_cast<u32>(start + length - 1), [&](const IR::LocationDescriptor& descriptor) {
+        if (block_entries.contains(descriptor)) {
+            result.push_back(descriptor.Value());
+        }
+    });
+    return result;
 }
 
 std::optional<u64> A32AddressSpace::GuestCodeHash(u64 descriptor_value,
@@ -206,7 +237,7 @@ std::optional<u64> A32AddressSpace::GuestCodeHash(u64 descriptor_value,
 }
 
 void A32AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    InvalidateBasicBlocks(block_ranges.ExtractRanges(ranges), true);
 }
 
 void A32AddressSpace::EmitPrelude() {
@@ -453,6 +484,14 @@ void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block,
 
 bool A32AddressSpace::CanReactivateBlock(CodePtr entry_point) const {
     return fast_precompiled_blocks.contains(entry_point);
+}
+
+void A32AddressSpace::RegisterReactivatedBlock(const CachedBlockEntry& entry) {
+    const A32::LocationDescriptor descriptor{IR::LocationDescriptor{entry.descriptor}};
+    const A32::LocationDescriptor end_location{IR::LocationDescriptor{entry.end_descriptor}};
+    block_ranges.AddRange(
+        boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1),
+        IR::LocationDescriptor{entry.descriptor});
 }
 
 void A32AddressSpace::ClearReactivationMetadata() {

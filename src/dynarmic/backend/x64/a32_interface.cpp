@@ -312,6 +312,10 @@ void Jit::InvalidateCacheRange(std::uint32_t start_address, std::size_t length) 
     impl->InvalidateCacheRange(start_address, length);
 }
 
+void Jit::InvalidateCacheRangeNow(std::uint32_t start_address, std::size_t length) {
+    impl->InvalidateCacheRange(start_address, length);
+}
+
 void Jit::Reset() {
     impl->Reset();
 }
@@ -372,7 +376,15 @@ std::vector<std::uint64_t> Jit::GetCompiledBlockDescriptors() const {
     return impl->GetCompiledBlockDescriptors();
 }
 
+std::vector<std::uint64_t> Jit::GetCompiledBlockDescriptors(std::uint32_t, std::size_t) const {
+    return impl->GetCompiledBlockDescriptors();
+}
+
 std::vector<JitBlockCacheEntry> Jit::GetCompiledBlockEntries() const {
+    return impl->GetCompiledBlockEntries();
+}
+
+std::vector<JitBlockCacheEntry> Jit::GetCompiledBlockEntries(std::uint32_t, std::size_t) const {
     return impl->GetCompiledBlockEntries();
 }
 

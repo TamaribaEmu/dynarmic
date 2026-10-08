@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <chrono>
 #include <condition_variable>
@@ -200,13 +202,56 @@ void AddressSpace::BeginCodeWriteBatch() {
     ASSERT(!code_write_batch_active);
     UnprotectCodeMemory();
     code_write_batch_active = true;
+    batch_code_start = static_cast<std::size_t>(code.offset());
+    batch_patches.clear();
+    batch_full_flush = false;
 }
 
 void AddressSpace::EndCodeWriteBatch() {
     ASSERT(code_write_batch_active);
-    mem.invalidate(mem.ptr(), static_cast<std::size_t>(code.offset()));
+    FlushBatchWrites();
     code_write_batch_active = false;
     ProtectCodeMemory();
+}
+
+void AddressSpace::FlushBatchWrites() {
+    const std::size_t end = static_cast<std::size_t>(code.offset());
+    if (batch_full_flush || end < batch_code_start) {
+        mem.invalidate(mem.ptr(), end);
+        return;
+    }
+    // This used to flush the whole used code region (tens of MiB once modules are warmed up)
+    // after every batch, even one that only relinked dormant blocks: ~75 ms per module load.
+    auto* const base = reinterpret_cast<std::uint8_t*>(mem.ptr());
+    if (end > batch_code_start) {
+        mem.invalidate(reinterpret_cast<std::uint32_t*>(base + batch_code_start), end - batch_code_start);
+    }
+    if (batch_patches.empty()) {
+        return;
+    }
+    // A patch is at most two instructions (ADRL): its first and last byte name every cache
+    // line it touches, whatever the line size.
+    std::vector<std::uintptr_t> lines;
+    lines.reserve(batch_patches.size() * 2);
+    for (const std::uintptr_t at : batch_patches) {
+        lines.push_back(at);
+        lines.push_back(at + 7);
+    }
+    std::sort(lines.begin(), lines.end());
+#if defined(__aarch64__) && !defined(__APPLE__) && !defined(_WIN32)
+    for (const std::uintptr_t at : lines) {
+        __asm__ volatile("dc cvau, %0" : : "r"(at) : "memory");
+    }
+    __asm__ volatile("dsb ish" : : : "memory");
+    for (const std::uintptr_t at : lines) {
+        __asm__ volatile("ic ivau, %0" : : "r"(at) : "memory");
+    }
+    __asm__ volatile("dsb ish\nisb" : : : "memory");
+#else
+    for (const std::uintptr_t at : batch_patches) {
+        mem.invalidate(reinterpret_cast<std::uint32_t*>(at), 8);
+    }
+#endif
 }
 
 void AddressSpace::BeginPrecompileBatch() {
@@ -248,7 +293,7 @@ void AddressSpace::EndPrecompileBatch() {
     for (const auto& incoming : incoming_relinks) {
         for (const CodePtr source : incoming.sources) {
             const auto block = block_infos.find(source);
-            if (block == block_infos.end()) {
+            if (block == block_infos.end() || !IsLiveBlock(source)) {
                 continue;
             }
             const auto relocations = block->second.block_relocations.find(incoming.descriptor);
@@ -305,14 +350,38 @@ std::size_t AddressSpace::ReactivateBlocks(const std::vector<CachedBlockEntry>& 
     }
 
     BeginCodeWriteBatch();
+    tsl::robin_set<CodePtr> reactivated;
+    reactivated.reserve(valid_entries.size());
+    tsl::robin_set<IR::LocationDescriptor> reactivated_descriptors;
+    reactivated_descriptors.reserve(valid_entries.size());
     for (const auto& entry : valid_entries) {
         block_entries.emplace(IR::LocationDescriptor{entry.descriptor}, entry.entry_point);
+        retired_entries.erase(entry.entry_point);
+        reactivated.insert(entry.entry_point);
+        reactivated_descriptors.insert(IR::LocationDescriptor{entry.descriptor});
+        RegisterReactivatedBlock(entry);
     }
+    // Branches between blocks of the set were left intact when they went dormant (nothing patches
+    // a block that is not live), and each still points at the set's own block for its target.
+    // Only branches leaving the set need patching to whatever runs there now.
+    oaknut::CodeGenerator patcher{mem.ptr(), mem.ptr()};
     for (const auto& entry : valid_entries) {
-        Link(block_infos.at(entry.entry_point));
+        const EmittedBlockInfo& block_info = block_infos.at(entry.entry_point);
+        for (const auto& [target_descriptor, list] : block_info.block_relocations) {
+            // A target in the set runs the set's block (just put in place), which the branch
+            // already points at; its reference was recorded when the branch was made, and
+            // references are only dropped by ClearCache.
+            if (reactivated_descriptors.contains(target_descriptor)) {
+                continue;
+            }
+            block_references[target_descriptor].insert(block_info.entry_point);
+            LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list, patcher);
+        }
     }
+    // Branches from blocks reactivated here were just linked above, with every block of the
+    // set already in place; only branches from elsewhere still point at the dispatcher.
     for (const auto& entry : valid_entries) {
-        RelinkForDescriptor(IR::LocationDescriptor{entry.descriptor}, entry.entry_point);
+        RelinkForDescriptorExcluding(IR::LocationDescriptor{entry.descriptor}, entry.entry_point, reactivated);
     }
     EndCodeWriteBatch();
     return valid_entries.size();
@@ -352,9 +421,31 @@ CacheStats AddressSpace::GetAndResetCacheStats() {
     return stats;
 }
 
-void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
+void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors,
+                                         bool keep_links_within_set) {
     if (!code_write_batch_active) {
         UnprotectCodeMemory();
+    }
+
+    if (keep_links_within_set) {
+        // Take the whole set out first, so relinking below only patches blocks that stay.
+        std::vector<IR::LocationDescriptor> removed;
+        removed.reserve(descriptors.size());
+        for (const auto& descriptor : descriptors) {
+            if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
+                retired_entries.insert(iter->second);
+                block_entries.erase(iter);
+                removed.push_back(descriptor);
+            }
+        }
+        invalidated_blocks_since_reset += removed.size();
+        for (const auto& descriptor : removed) {
+            RelinkForDescriptor(descriptor, nullptr);
+        }
+        if (!code_write_batch_active) {
+            ProtectCodeMemory();
+        }
+        return;
     }
 
     for (const auto& descriptor : descriptors) {
@@ -369,6 +460,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
         // and the currently executing block may have references to itself which need to be unlinked.
         RelinkForDescriptor(descriptor, nullptr);
 
+        retired_entries.insert(iter->second);
         block_entries.erase(iter);
     }
 
@@ -379,8 +471,10 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
 
 void AddressSpace::ClearCache() {
     ++cache_clears_since_reset;
+    batch_full_flush = true;  // inside a write batch: code restarts from the bottom
     ClearReactivationMetadata();
     block_entries.clear();
+    retired_entries.clear();
     reverse_block_entries.clear();
     block_end_locations.clear();
     block_infos.clear();
@@ -528,6 +622,9 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
 
     for (auto [ptr_offset, type] : block_relocations_list) {
         patcher.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+        if (code_write_batch_active) {
+            batch_patches.push_back(reinterpret_cast<std::uintptr_t>(entry_point + ptr_offset));
+        }
 
         switch (type) {
         case BlockRelocationType::Branch:
@@ -550,6 +647,10 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
     }
 }
 
+bool AddressSpace::IsLiveBlock(CodePtr entry_point) const {
+    return !retired_entries.contains(entry_point);
+}
+
 void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
     static const tsl::robin_set<CodePtr> no_exclusions;
     RelinkForDescriptorExcluding(target_descriptor, target_ptr, no_exclusions);
@@ -558,8 +659,12 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
 void AddressSpace::RelinkForDescriptorExcluding(
         IR::LocationDescriptor target_descriptor, CodePtr target_ptr,
         const tsl::robin_set<CodePtr>& excluded_entries) {
-    for (auto code_ptr : block_references[target_descriptor]) {
-        if (excluded_entries.contains(code_ptr)) {
+    const auto references = block_references.find(target_descriptor);
+    if (references == block_references.end()) {
+        return;
+    }
+    for (auto code_ptr : references->second) {
+        if (excluded_entries.contains(code_ptr) || !IsLiveBlock(code_ptr)) {
             continue;
         }
         if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
